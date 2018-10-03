@@ -501,60 +501,25 @@ alloc:
 	return 0;
 }
 
-static void __allocate_data_blocks(struct inode *inode, loff_t offset,
-							size_t count)
+ssize_t f2fs_preallocate_blocks(struct inode *inode, loff_t pos,
+					size_t count, bool dio)
 {
-	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
-	struct dnode_of_data dn;
-	u64 start = F2FS_BYTES_TO_BLK(offset);
-	u64 len = F2FS_BYTES_TO_BLK(count);
-	bool allocated;
-	u64 end_offset;
+	struct f2fs_map_blocks map;
+	ssize_t ret = 0;
 
-	while (len) {
-		f2fs_balance_fs(sbi);
-		f2fs_lock_op(sbi);
+	if (is_inode_flag_set(F2FS_I(inode), FI_NO_PREALLOC))
+		return 0;
 
-		/* When reading holes, we need its node page */
-		set_new_dnode(&dn, inode, NULL, NULL, 0);
-		if (get_dnode_of_data(&dn, start, ALLOC_NODE))
-			goto out;
+	map.m_lblk = F2FS_BYTES_TO_BLK(pos);
+	map.m_len = F2FS_BYTES_TO_BLK(count);
 
-		allocated = false;
-		end_offset = ADDRS_PER_PAGE(dn.node_page, F2FS_I(inode));
-
-		while (dn.ofs_in_node < end_offset && len) {
-			block_t blkaddr;
-
-			if (unlikely(f2fs_cp_error(sbi)))
-				goto sync_out;
-
-			blkaddr = datablock_addr(dn.node_page, dn.ofs_in_node);
-			if (blkaddr == NULL_ADDR || blkaddr == NEW_ADDR) {
-				if (__allocate_data_block(&dn))
-					goto sync_out;
-				allocated = true;
-			}
-			len--;
-			start++;
-			dn.ofs_in_node++;
-		}
-
-		if (allocated)
-			sync_inode_page(&dn);
-
-		f2fs_put_dnode(&dn);
-		f2fs_unlock_op(sbi);
+	if (dio && !(f2fs_encrypted_inode(inode) && S_ISREG(inode->i_mode))) {
+		ret = f2fs_convert_inline_inode(inode);
+		if (ret)
+			return ret;
+		ret = f2fs_map_blocks(inode, &map, 1, F2FS_GET_BLOCK_PRE_DIO);
 	}
-	return;
-
-sync_out:
-	if (allocated)
-		sync_inode_page(&dn);
-	f2fs_put_dnode(&dn);
-out:
-	f2fs_unlock_op(sbi);
-	return;
+	return ret;
 }
 
 /*
@@ -566,7 +531,7 @@ out:
  *     b. do not use extent cache for better performance
  *     c. give the block addresses to blockdev
  */
-static int f2fs_map_blocks(struct inode *inode, struct f2fs_map_blocks *map,
+int f2fs_map_blocks(struct inode *inode, struct f2fs_map_blocks *map,
 						int create, int flag)
 {
 	unsigned int maxblocks = map->m_len;
@@ -577,6 +542,7 @@ static int f2fs_map_blocks(struct inode *inode, struct f2fs_map_blocks *map,
 	int err = 0, ofs = 1;
 	struct extent_info ei;
 	bool allocated = false;
+	block_t blkaddr;
 
 	map->m_len = 0;
 	map->m_flags = 0;
@@ -591,8 +557,9 @@ static int f2fs_map_blocks(struct inode *inode, struct f2fs_map_blocks *map,
 		goto out;
 	}
 
+next_dnode:
 	if (create)
-		f2fs_lock_op(F2FS_I_SB(inode));
+		f2fs_lock_op(sbi);
 
 	/* When reading holes, we need its node page */
 	set_new_dnode(&dn, inode, NULL, NULL, 0);
@@ -603,106 +570,76 @@ static int f2fs_map_blocks(struct inode *inode, struct f2fs_map_blocks *map,
 		goto unlock_out;
 	}
 
-	if (dn.data_blkaddr == NEW_ADDR || dn.data_blkaddr == NULL_ADDR) {
+	end_offset = ADDRS_PER_PAGE(dn.node_page, F2FS_I(inode));
+
+next_block:
+	blkaddr = datablock_addr(dn.node_page, dn.ofs_in_node);
+
+	if (blkaddr == NEW_ADDR || blkaddr == NULL_ADDR) {
 		if (create) {
 			if (unlikely(f2fs_cp_error(sbi))) {
 				err = -EIO;
-				goto put_out;
+				goto sync_out;
 			}
 			err = __allocate_data_block(&dn);
 			if (err)
-				goto put_out;
+				goto sync_out;
 			allocated = true;
 			map->m_flags = F2FS_MAP_NEW;
+			blkaddr = dn.data_blkaddr;
 		} else {
 			if (flag != F2FS_GET_BLOCK_FIEMAP ||
-						dn.data_blkaddr != NEW_ADDR) {
+						blkaddr != NEW_ADDR) {
 				if (flag == F2FS_GET_BLOCK_BMAP)
 					err = -ENOENT;
-				goto put_out;
+				goto sync_out;
 			}
-
-			/*
-			 * preallocated unwritten block should be mapped
-			 * for fiemap.
-			 */
-			if (dn.data_blkaddr == NEW_ADDR)
-				map->m_flags = F2FS_MAP_UNWRITTEN;
 		}
 	}
 
-	map->m_flags |= F2FS_MAP_MAPPED;
-	map->m_pblk = dn.data_blkaddr;
-	map->m_len = 1;
+	if (map->m_len == 0) {
+		/* preallocated unwritten block should be mapped for fiemap. */
+		if (blkaddr == NEW_ADDR)
+			map->m_flags |= F2FS_MAP_UNWRITTEN;
+		map->m_flags |= F2FS_MAP_MAPPED;
 
-	end_offset = ADDRS_PER_PAGE(dn.node_page, F2FS_I(inode));
+		map->m_pblk = blkaddr;
+		map->m_len = 1;
+	} else if ((map->m_pblk != NEW_ADDR &&
+			blkaddr == (map->m_pblk + ofs)) ||
+			(map->m_pblk == NEW_ADDR && blkaddr == NEW_ADDR) ||
+			flag == F2FS_GET_BLOCK_PRE_DIO) {
+		ofs++;
+		map->m_len++;
+	} else {
+		goto sync_out;
+	}
+
 	dn.ofs_in_node++;
 	pgofs++;
 
-get_next:
-	if (dn.ofs_in_node >= end_offset) {
+	if (map->m_len < maxblocks) {
+		if (dn.ofs_in_node < end_offset)
+			goto next_block;
+
 		if (allocated)
 			sync_inode_page(&dn);
 		allocated = false;
 		f2fs_put_dnode(&dn);
 
-		set_new_dnode(&dn, inode, NULL, NULL, 0);
-		err = get_dnode_of_data(&dn, pgofs, mode);
-		if (err) {
-			if (err == -ENOENT)
-				err = 0;
-			goto unlock_out;
+		if (create) {
+			f2fs_unlock_op(sbi);
 		}
-
-		end_offset = ADDRS_PER_PAGE(dn.node_page, F2FS_I(inode));
+		goto next_dnode;
 	}
 
-	if (maxblocks > map->m_len) {
-		block_t blkaddr = datablock_addr(dn.node_page, dn.ofs_in_node);
-
-		if (blkaddr == NEW_ADDR || blkaddr == NULL_ADDR) {
-			if (create) {
-				if (unlikely(f2fs_cp_error(sbi))) {
-					err = -EIO;
-					goto sync_out;
-				}
-				err = __allocate_data_block(&dn);
-				if (err)
-					goto sync_out;
-				allocated = true;
-				map->m_flags |= F2FS_MAP_NEW;
-				blkaddr = dn.data_blkaddr;
-			} else {
-				/*
-				 * we only merge preallocated unwritten blocks
-				 * for fiemap.
-				 */
-				if (flag != F2FS_GET_BLOCK_FIEMAP ||
-						blkaddr != NEW_ADDR)
-					goto sync_out;
-			}
-		}
-
-		/* Give more consecutive addresses for the readahead */
-		if ((map->m_pblk != NEW_ADDR &&
-				blkaddr == (map->m_pblk + ofs)) ||
-				(map->m_pblk == NEW_ADDR &&
-				blkaddr == NEW_ADDR)) {
-			ofs++;
-			dn.ofs_in_node++;
-			pgofs++;
-			map->m_len++;
-			goto get_next;
-		}
-	}
 sync_out:
 	if (allocated)
 		sync_inode_page(&dn);
-put_out:
 	f2fs_put_dnode(&dn);
 unlock_out:
 	if (create)
-		f2fs_unlock_op(F2FS_I_SB(inode));
+		f2fs_unlock_op(sbi);
 out:
 	trace_f2fs_map_blocks(inode, map, err);
 	return err;
@@ -1550,38 +1487,21 @@ static int check_direct_IO(struct inode *inode, struct iov_iter *iter,
 static ssize_t f2fs_direct_IO(int rw, struct kiocb *iocb, struct iov_iter *iter,
 			      loff_t offset)
 {
-	struct file *file = iocb->ki_filp;
-	struct address_space *mapping = file->f_mapping;
+	struct address_space *mapping = iocb->ki_filp->f_mapping;
 	struct inode *inode = mapping->host;
 	size_t count = iov_iter_count(iter);
 	int err;
-
-	/* we don't need to use inline_data strictly */
-	if (f2fs_has_inline_data(inode)) {
-		err = f2fs_convert_inline_inode(inode);
-		if (err)
-			return err;
-	}
-
-	if (f2fs_encrypted_inode(inode) && S_ISREG(inode->i_mode))
-		return 0;
 
 	err = check_direct_IO(inode, iter, offset);
 	if (err)
 		return err;
 
+	if (f2fs_encrypted_inode(inode) && S_ISREG(inode->i_mode))
+		return 0;
+
 	trace_f2fs_direct_IO_enter(inode, offset, count, rw);
 
-	if (rw & WRITE) {
-		__allocate_data_blocks(inode, offset, count);
-		if (unlikely(f2fs_cp_error(F2FS_I_SB(inode)))) {
-			err = -EIO;
-			goto out;
-		}
-	}
-
 	err = blockdev_direct_IO(rw, iocb, inode, iter, offset, get_data_block_dio);
-out:
 	if (err < 0 && (rw & WRITE))
 		f2fs_write_failed(mapping, offset + count);
 

@@ -20,6 +20,7 @@
 #include <linux/uaccess.h>
 #include <linux/mount.h>
 #include <linux/pagevec.h>
+#include <linux/uio.h>
 #include <linux/random.h>
 #include <linux/aio.h>
 
@@ -1719,14 +1720,45 @@ long f2fs_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 
 static ssize_t f2fs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
-	struct inode *inode = file_inode(iocb->ki_filp);
+	struct file *file = iocb->ki_filp;
+	struct inode *inode = file_inode(file);
+	size_t count = iov_iter_count(from);
+	loff_t pos = iocb->ki_pos;
+	ssize_t ret;
 
 	if (f2fs_encrypted_inode(inode) &&
 				!f2fs_has_encryption_key(inode) &&
 				f2fs_get_encryption_info(inode))
 		return -EACCES;
 
-	return generic_file_write_iter(iocb, from);
+	inode_lock(inode);
+	ret = generic_write_checks(file, &pos, &count, S_ISBLK(inode->i_mode));
+	if (!ret) {
+		int err;
+
+		if (iov_iter_fault_in_readable(from, iov_iter_count(from)))
+			set_inode_flag(F2FS_I(inode), FI_NO_PREALLOC);
+
+		err = f2fs_preallocate_blocks(inode, pos, count,
+				file->f_flags & O_DIRECT);
+		if (err) {
+			clear_inode_flag(F2FS_I(inode), FI_NO_PREALLOC);
+			inode_unlock(inode);
+			return err;
+		}
+		ret = __generic_file_write_iter(iocb, from);
+		clear_inode_flag(F2FS_I(inode), FI_NO_PREALLOC);
+	}
+	inode_unlock(inode);
+
+	if (ret > 0) {
+		ssize_t err;
+
+		err = generic_write_sync(file, iocb->ki_pos - ret, ret);
+		if (err < 0)
+			ret = err;
+	}
+	return ret;
 }
 
 #ifdef CONFIG_COMPAT

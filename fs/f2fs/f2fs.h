@@ -102,6 +102,16 @@ static inline bool f2fs_crc_valid(__u32 blk_crc, void *buf, size_t buf_size)
 	return f2fs_crc32(buf, buf_size) == blk_crc;
 }
 
+static inline void inode_lock(struct inode *inode)
+{
+	mutex_lock(&inode->i_mutex);
+}
+
+static inline void inode_unlock(struct inode *inode)
+{
+	mutex_unlock(&inode->i_mutex);
+}
+
 /*
  * For checkpoint manager
  */
@@ -375,6 +385,7 @@ struct f2fs_map_blocks {
 #define F2FS_GET_BLOCK_DIO		1
 #define F2FS_GET_BLOCK_FIEMAP		2
 #define F2FS_GET_BLOCK_BMAP		3
+#define F2FS_GET_BLOCK_PRE_DIO		4
 
 /*
  * i_advise uses FADVISE_XXX_BIT. We can add additional hints later.
@@ -1389,6 +1400,7 @@ enum {
 	FI_DROP_CACHE,		/* drop dirty page cache */
 	FI_DATA_EXIST,		/* indicate data exists */
 	FI_INLINE_DOTS,		/* indicate inline dot dentries */
+	FI_NO_PREALLOC,		/* indicate skipped preallocated blocks */
 };
 
 static inline void set_inode_flag(struct f2fs_inode_info *fi, int flag)
@@ -1678,6 +1690,8 @@ void f2fs_delete_entry(struct f2fs_dir_entry *, struct page *, struct inode *,
 							struct inode *);
 int f2fs_do_tmpfile(struct inode *, struct inode *);
 bool f2fs_empty_dir(struct inode *);
+int f2fs_map_blocks(struct inode *inode, struct f2fs_map_blocks *map,
+		                           int create, int flag);
 
 static inline int f2fs_add_link(struct dentry *dentry, struct inode *inode)
 {
@@ -1812,6 +1826,7 @@ void f2fs_submit_page_mbio(struct f2fs_io_info *);
 void set_data_blkaddr(struct dnode_of_data *);
 int reserve_new_block(struct dnode_of_data *);
 int f2fs_get_block(struct dnode_of_data *, pgoff_t);
+ssize_t f2fs_preallocate_blocks(struct inode *, loff_t, size_t, bool);
 int f2fs_reserve_block(struct dnode_of_data *, pgoff_t);
 struct page *get_read_data_page(struct inode *, pgoff_t, int);
 struct page *find_data_page(struct inode *, pgoff_t);
